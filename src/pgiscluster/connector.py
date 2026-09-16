@@ -1,5 +1,8 @@
+import base64
 from abc import ABC, abstractmethod
-from typing import cast
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
 import geopandas as gpd
 import kubernetes as k8s
@@ -10,20 +13,21 @@ from sqlalchemy import event
 class DBConnector(ABC):
     """Assembles a PostgreSQL connection address, then queries the database"""
 
-    def __init__(self, database="data_science") -> None:
+    def __init__(
+        self,
+        database: str = "data_science",
+        target_resolver: Callable[[], tuple[str, int]] | None = None,
+    ) -> None:
         self.drivername = "postgresql+psycopg"
         self.database = database
-        self.host, self.port = self._get_target()
+        self.host, self.port = (target_resolver or self._get_target)()
         self.engine = self._create_engine()
 
-    @abstractmethod
     def _get_target(self) -> tuple[str, int]:
         """Returns the (host, port) to connect to, resolved live from the cluster's CiliumLocalRedirectPolicy."""
         k8s.config.load_kube_config()
-        crd_list = cast(
-            k8s.client.V1CustomResourceDefinitionList,
-            k8s.client.ApiextensionsV1Api().list_custom_resource_definition(),
-        )
+        crd_list = k8s.client.ApiextensionsV1Api().list_custom_resource_definition()
+        assert isinstance(crd_list, k8s.client.V1CustomResourceDefinitionList)
         assert crd_list.items is not None
 
         local_policy = next(
@@ -52,15 +56,15 @@ class DBConnector(ABC):
             raise RuntimeError(
                 f"{local_policy.metadata.name} CRD has multiple storage versions"
             )
-        result = cast(
-            dict,
-            k8s.client.CustomObjectsApi().list_cluster_custom_object(
-                group=group,
-                plural=plural,
-                version=storage_version.name,
-                label_selector="app.kubernetes.io/name=postgis-cluster",
-            ),
+        raw_result = k8s.client.CustomObjectsApi().list_cluster_custom_object(
+            group=group,
+            plural=plural,
+            version=storage_version.name,
+            label_selector="app.kubernetes.io/name=postgis-cluster",
         )
+        # kubernetes client lacks type hints until v37; drop this on its release
+        assert isinstance(raw_result, dict)
+        result: dict[str, Any] = raw_result
         if len(result["items"]) != 1:
             raise RuntimeError(
                 f"expected exactly one CiliumLocalRedirectPolicy matching label "
@@ -94,8 +98,21 @@ class DBConnector(ABC):
 
         return engine
 
-    def database_query(self, query: str, geom_col: str) -> gpd.GeoDataFrame:
-        """Runs user-defined SQL query against PostGIS Database"""
+    def db_query(
+        self,
+        query_file: str | Path | None = None,
+        *,
+        query: str | None = None,
+        geom_col: str,
+    ) -> gpd.GeoDataFrame:
+        """Runs a SQL query against the PostGIS database, returning a GeoDataFrame.
+
+        Provide query_file (a path to a .sql file) or query (a literal SQL string).
+        """
+        if query is None:
+            if query_file is None:
+                raise ValueError("either query_file or query must be given")
+            query = Path(query_file).read_text()
         geodataframe = gpd.read_postgis(
             sql=query,
             con=self.engine,
@@ -103,3 +120,41 @@ class DBConnector(ABC):
             geom_col=geom_col,
         )
         return geodataframe
+
+
+class HostDBConnector(DBConnector):
+    """Connects to the database from outside the cluster, using
+    the VSO-synced dynamic-credentials Secret."""
+
+    SECRET_NAME = "postgis-app-dynamic-credentials"
+    SECRET_NAMESPACE = "databases"
+
+    def _get_credentials(self) -> tuple[str, str]:
+        """Returns a fresh (username, password) pair decoded from the VSO-synced Secret."""
+        secret = k8s.client.CoreV1Api().read_namespaced_secret(
+            self.SECRET_NAME, self.SECRET_NAMESPACE
+        )
+        assert isinstance(secret, k8s.client.V1Secret)
+        assert secret.data is not None
+        missing_keys = [
+            key for key in ("username", "password") if key not in secret.data
+        ]
+        if missing_keys:
+            raise RuntimeError(
+                f"{self.SECRET_NAME} Secret missing key(s): {', '.join(missing_keys)}"
+            )
+        username = base64.b64decode(secret.data["username"]).decode()
+        password = base64.b64decode(secret.data["password"]).decode()
+        return (username, password)
+
+
+class HostAdminDBConnector(HostDBConnector):
+    """Connects to the database from outside the cluster using the Postgres
+    superuser credential, for schema/DDL changes rather than routine queries.
+
+    Unlike HostDBConnector's dynamic lease, this credential is static
+    (doesn't expire or rotate) and unscoped to a single database — it's the
+    same credential CloudNativePG itself uses for cluster bootstrap and
+    reconciliation. Use deliberately, not as a default."""
+
+    SECRET_NAME = "postgis-app-credentials"

@@ -83,9 +83,9 @@
 #   when: the engine's "do_connect" event fires
 #   then: cparams["user"], ["password"], ["host"], ["port"], ["dbname"] match those sources
 
-# --- DBConnector.postgis_query ---
+# --- DBConnector.db_query ---
 
-# test_postgis_query_calls_read_postgis_with_given_args
+# test_db_query_calls_read_postgis_with_given_args
 #   given: a DBConnector with a mocked engine
-#   when: postgis_query(query, geom_col) is called
+#   when: db_query(query, geom_col) is called
 #   then: geopandas.read_postgis is called with that query, the engine, and that geom_col
