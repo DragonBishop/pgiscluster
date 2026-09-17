@@ -1,0 +1,13 @@
+# Changes here will be overwritten by Copier
+_commit: v1.5.0
+_src_path: https://github.com/DragonBishop/python-copier-template-ds.git
+github_actions: true
+include_module: true
+include_notebooks: false
+include_reports: false
+module_name: pgiscluster
+project_name: pgiscluster
+project_type: data_science
+publish_to_pypi: true
+python_version: 3.14.7
+use_rumdl: true
