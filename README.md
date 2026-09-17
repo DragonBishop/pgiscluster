@@ -1,6 +1,6 @@
 # pgiscluster
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/DragonBishop/data_science_cluster/blob/main/LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/DragonBishop/pgiscluster/blob/main/LICENSE)
 [![Python 3.14+](https://img.shields.io/badge/python-3.14%2B-blue.svg)](https://www.python.org/downloads/)
 
 Python classes for connecting to and querying a PostGIS database, with credentials resolved dynamically at runtime.
@@ -35,7 +35,9 @@ pip install pgiscluster
 from pgiscluster import HostDBConnector
 
 connector = HostDBConnector()
-df = connector.db_query("queries/nearby.sql", geom_col="geom")  # from a .sql file (default)
+df = connector.db_query(
+    "queries/nearby.sql", geom_col="geom"
+)  # from a .sql file (default)
 df = connector.db_query(query="SELECT * FROM my_table", geom_col="geom")  # literal SQL
 ```
 
@@ -69,12 +71,12 @@ connector = HostAdminDBConnector()
 
 ## License
 
-See [MIT LICENSE](https://github.com/DragonBishop/data_science_cluster/blob/main/LICENSE).
+See [MIT LICENSE](https://github.com/DragonBishop/pgiscluster/blob/main/LICENSE).
 
 ## Links
 
-- [Source](https://github.com/DragonBishop/data_science_cluster)
-- [Issues](https://github.com/DragonBishop/data_science_cluster/issues)
-- [Changelog](https://github.com/DragonBishop/data_science_cluster/blob/main/CHANGELOG.md) (covers the whole repo, not just this package)
+- [Source](https://github.com/DragonBishop/pgiscluster)
+- [Issues](https://github.com/DragonBishop/pgiscluster/issues)
+- [Changelog](https://github.com/DragonBishop/pgiscluster/blob/main/CHANGELOG.md)
 
-`pgiscluster` lives inside the [Data Science Cluster](https://github.com/DragonBishop/data_science_cluster) repo. If you want to contribute, open a development branch and then submit a pull request.
+`pgiscluster` was originally developed inside the [Data Science Cluster](https://github.com/DragonBishop/data_science_cluster) repo, the reference cluster its defaults are built against. If you want to contribute, open a development branch and then submit a pull request.
