@@ -1,6 +1,6 @@
 # Changes here will be overwritten by Copier
 _commit: v1.5.0
-_src_path: https://github.com/DragonBishop/python-copier-template-ds.git
+_src_path: gh:DragonBishop/python-copier-template-ds
 github_actions: true
 include_module: true
 include_notebooks: false
