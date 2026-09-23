@@ -1,3 +1,12 @@
+## [0.2.1] - 2026-09-23
+
+### 🐛 Bug Fixes
+
+- Update source path format in .copier-answers.yml
+
+### ⚙️ Miscellaneous Tasks
+
+- Update version in .copier-answers.yml and release workflow, adjust changelog generation logic
 ## [0.2.0] - 2026-09-17
 
 ### 🚀 Features
@@ -11,12 +20,9 @@
 
 ### 📚 Documentation
 
-- Regenerate changelog for v1.0.0
 - Move package README to repo root, fix repo links
 
 ### ⚙️ Miscellaneous Tasks
 
-- *(main)* Release 1.0.0
 - Rename package to pgiscluster and prune unused dependencies
 - Scaffold repo from python-copier-template-ds
-- *(main)* Release 0.2.0
