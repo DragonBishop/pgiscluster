@@ -19,7 +19,7 @@ test-cov:
 update:
   uv sync -U --all-groups --all-extras --inexact
 
-# set up git filters (nbwipers) and pre-commit hooks
+# set up pre-commit hooks
 git-setup:
   @[ -d .git ] || git init
   uv run prek install
