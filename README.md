@@ -55,7 +55,7 @@ By default, `HostDBConnector` resolves host/port from the cluster's `CiliumLocal
 connector = HostDBConnector(target_resolver=lambda: ("localhost", 5432))
 ```
 
-Credentials come from a Kubernetes Secret. Its name and namespace are set by the class attributes `HostDBConnector.SECRET_NAME` and `HostDBConnector.SECRET_NAMESPACE`. You can override them to point elsewhere. The reference cluster populates that Secret via the Vault Secrets Operator, syncing a dynamically-generated HashiCorp Vault credential. However, any mechanism works as long as the Secret has `username`/`password` keys.
+Credentials come from a Kubernetes Secret. Its name and namespace are set by the class attributes `HostDBConnector.SECRET_NAME` and `HostDBConnector.SECRET_NAMESPACE`. You can override them to point elsewhere. The reference cluster populates that Secret with External Secrets Operator, syncing a dynamically-generated OpenBao database credential. However, any mechanism works as long as the Secret has `username`/`password` keys.
 
 `db_query(query_file=None, *, query=None, geom_col)` runs a SQL query and returns a [GeoDataFrame](https://geopandas.org/), decoding one geometry column per call. One of either `query_file` (a path to a `.sql` file, the default), or `query`, a literal SQL string.
 

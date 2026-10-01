@@ -124,13 +124,13 @@ class DBConnector(ABC):
 
 class HostDBConnector(DBConnector):
     """Connects to the database from outside the cluster, using
-    the VSO-synced dynamic-credentials Secret."""
+    the operator-synced dynamic-credentials Secret."""
 
     SECRET_NAME = "postgis-app-dynamic-credentials"
     SECRET_NAMESPACE = "databases"
 
     def _get_credentials(self) -> tuple[str, str]:
-        """Returns a fresh (username, password) pair decoded from the VSO-synced Secret."""
+        """Returns a fresh (username, password) pair decoded from the operator-synced Secret."""
         secret = k8s.client.CoreV1Api().read_namespaced_secret(
             self.SECRET_NAME, self.SECRET_NAMESPACE
         )
