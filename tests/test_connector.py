@@ -46,7 +46,7 @@
 
 # test_get_credentials_fetches_fresh_each_call
 #   given: the mocked Secret read returns different values on two successive calls
-#     (simulating Vault's lease rotation / VSO's refreshAfter)
+#     (simulating the secrets operator's credential rotation)
 #   when: _get_credentials is called twice
 #   then: read_namespaced_secret is called each time, not cached, and each call
 #     returns that call's current values
@@ -58,7 +58,7 @@
 
 # --- ClusterDBConnector._get_credentials ---
 
-# test_get_credentials_returns_username_and_password_from_vault
+# test_get_credentials_returns_username_and_password_from_secrets_backend
 #   given: mocked hvac client read of "database/creds/postgis-app-role" returns
 #     data containing "username" and "password"
 #   when: _get_credentials is called
@@ -68,10 +68,10 @@
 #   given: the mocked hvac read returns different lease credentials on two
 #     successive calls
 #   when: _get_credentials is called twice
-#   then: the Vault read happens each time, not cached, and each call returns
+#   then: the secrets-backend read happens each time, not cached, and each call returns
 #     that call's current values
 
-# test_get_credentials_raises_when_vault_response_missing_credentials
+# test_get_credentials_raises_when_backend_response_missing_credentials
 #   given: the hvac response data is missing "username" or "password"
 #   when: _get_credentials is called
 #   then: raises RuntimeError naming the missing key
