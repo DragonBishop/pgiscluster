@@ -1,3 +1,8 @@
+## [0.3.1] - 2026-10-17
+
+### 🐛 Bug Fixes
+
+- Update Python version requirements and adjust CI configuration
 ## [0.3.0] - 2026-10-17
 
 ### 🚀 Features
