@@ -132,8 +132,8 @@ class HostDBConnector(DBConnector):
         secret = k8s.client.CoreV1Api().read_namespaced_secret(
             self.SECRET_NAME, self.SECRET_NAMESPACE
         )
-        assert isinstance(secret, k8s.client.V1Secret)
-        assert secret.data is not None
+        if secret.data is None:
+            raise RuntimeError(f"{self.SECRET_NAME} Secret has no data")
         missing_keys = [
             key for key in ("username", "password") if key not in secret.data
         ]
