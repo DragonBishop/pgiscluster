@@ -27,8 +27,6 @@ class DBConnector(ABC):
         """Returns the (host, port) to connect to, resolved live from the cluster's CiliumLocalRedirectPolicy."""
         k8s.config.load_kube_config()
         crd_list = k8s.client.ApiextensionsV1Api().list_custom_resource_definition()
-        assert isinstance(crd_list, k8s.client.V1CustomResourceDefinitionList)
-        assert crd_list.items is not None
 
         local_policy = next(
             crd
@@ -41,20 +39,18 @@ class DBConnector(ABC):
             version for version in local_policy.spec.versions if version.served
         ]
         if not served_versions:
-            raise RuntimeError(
-                f"{local_policy.metadata.name} CRD has no served version"
-            )
+            raise RuntimeError("CiliumLocalRedirectPolicy CRD has no served version")
         storage_version_options = (
             version for version in served_versions if version.storage
         )
         storage_version = next(storage_version_options, None)
         if storage_version is None:
             raise RuntimeError(
-                f"{local_policy.metadata.name} CRD has no storage version among its served versions"
+                "CiliumLocalRedirectPolicy CRD has no storage version among its served versions"
             )
         if next(storage_version_options, None) is not None:
             raise RuntimeError(
-                f"{local_policy.metadata.name} CRD has multiple storage versions"
+                "CiliumLocalRedirectPolicy CRD has multiple storage versions"
             )
         raw_result = k8s.client.CustomObjectsApi().list_cluster_custom_object(
             group=group,
@@ -62,8 +58,10 @@ class DBConnector(ABC):
             version=storage_version.name,
             label_selector="app.kubernetes.io/name=postgis-cluster",
         )
-        # kubernetes client lacks type hints until v37; drop this on its release
-        assert isinstance(raw_result, dict)
+        if not isinstance(raw_result, dict):
+            raise TypeError(
+                f"expected a dict from list_cluster_custom_object, got {type(raw_result).__name__}"
+            )
         result: dict[str, Any] = raw_result
         if len(result["items"]) != 1:
             raise RuntimeError(
