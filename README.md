@@ -5,11 +5,11 @@
 
 Python classes for connecting to and querying a PostGIS database, with credentials resolved dynamically at runtime.
 
-**Status: Alpha.** Only `HostDBConnector` is implemented. `ClusterDBConnector` is planned but not built. Its default address and credential discovery assume specific cluster infrastructure, but both are plain, overridable methods.
+**Status: Alpha.** `HostDBConnector` connects from a workstation and `ClusterDBConnector` connects from inside a pod. Their default addresses and credential sources assume specific cluster infrastructure, but all of them are plain, overridable class attributes and methods. This package is a prototype. Its successor, Cluster Connect, will replace it.
 
 ## Key features
 
-- Fetches credentials from a Kubernetes Secret on every connection, so rotation is picked up automatically.
+- Fetches credentials on every connection, from a Kubernetes Secret (`HostDBConnector`) or straight from OpenBao or Vault (`ClusterDBConnector`), so rotation is picked up automatically.
 - Resolves the database address live from the cluster.
 - Query results returned as GeoDataFrames for downstream GIS/analytics work.
 
@@ -68,6 +68,56 @@ from pgiscluster import HostAdminDBConnector
 
 connector = HostAdminDBConnector()
 ```
+
+#### `ClusterDBConnector`
+
+For code running inside the cluster, such as Prefect flow-run Jobs. On every new connection it logs in to OpenBao (or Vault) with Kubernetes auth, then generates a fresh database login from `database/creds/<DATABASE_ROLE>`. It needs no kubeconfig and no read access to Secrets.
+
+The class attributes:
+
+| Attribute | Default | Meaning |
+| :--- | :--- | :--- |
+| `AUTH_ROLE` | `None` (required) | The OpenBao Kubernetes auth role the pod logs in as |
+| `DATABASE_ROLE` | `"postgis-app-role"` | The database secrets engine role to read |
+| `TOKEN_PATH` | `"/var/run/secrets/openbao/token"` | The projected service account token to log in with |
+| `HOST`, `PORT` | `"postgis-cluster-rw.databases.svc.cluster.local"`, `5432` | The in-cluster read-write Service |
+
+`AUTH_ROLE` has no default, because each app logs in with its own role. Set it in a subclass:
+
+```python
+from pgiscluster import ClusterDBConnector
+
+
+class EtlDB(ClusterDBConnector):
+    AUTH_ROLE = "etl-role"
+
+
+connector = EtlDB(database="etl")
+```
+
+The server address comes from `BAO_ADDR`, then `VAULT_ADDR`, and its CA file from `BAO_CACERT`, then `VAULT_CACERT`. With no CA file set, the system CAs are used. Postgres TLS follows libpq's own `PGSSLMODE` and `PGSSLROOTCERT` variables.
+
+The pod needs:
+
+- an OpenBao Kubernetes auth role bound to its service account, with a policy that can `read` `database/creds/<DATABASE_ROLE>`;
+- a projected token for the audience the auth role checks, mounted at `TOKEN_PATH`;
+- a network policy allowing egress to OpenBao on 8200 and to Postgres on 5432.
+
+```yaml
+volumes:
+  - name: openbao-token
+    projected:
+      sources:
+        - serviceAccountToken:
+            audience: openbao
+            expirationSeconds: 600
+            path: token
+containers:
+  - volumeMounts:
+      - {name: openbao-token, mountPath: /var/run/secrets/openbao, readOnly: true}
+```
+
+Each connection creates a new database login with its own lease. Leases are not revoked when connections close, so each one lasts until its TTL ends. Keep the role's TTL short.
 
 ## License
 
