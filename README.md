@@ -5,7 +5,7 @@
 
 Python classes for connecting to and querying a PostGIS database, with credentials resolved dynamically at runtime.
 
-**Status: Alpha.** `HostDBConnector` connects from a workstation and `ClusterDBConnector` connects from inside a pod. Their default addresses and credential sources assume specific cluster infrastructure, but all of them are plain, overridable class attributes and methods. This package is a prototype. Its successor, Cluster Connect, will replace it.
+**Status: Alpha.** `HostDBConnector` and `HostAdminDBConnector` connect from a workstation, and `ClusterDBConnector` and `ClusterAdminDBConnector` connect from inside a pod. Their default addresses and credential sources assume specific cluster infrastructure, but all of them are plain, overridable class attributes and methods. This package is a prototype. Its successor, Cluster Connect, will replace it.
 
 ## Key features
 
@@ -118,6 +118,23 @@ containers:
 ```
 
 Each connection creates a new database login with its own lease. Leases are not revoked when connections close, so each one lasts until its TTL ends. Keep the role's TTL short.
+
+#### `ClusterAdminDBConnector`
+
+A `ClusterDBConnector` subclass for schema/DDL changes from inside a pod. It logs in the same way, then reads the Postgres **superuser** credential from the OpenBao KV v2 entry `KV_MOUNT/KV_PATH` (default `secret/postgis`) instead of generating a dynamic login. This is the entry External Secrets Operator syncs into the Secret `HostAdminDBConnector` reads.
+
+```python
+from pgiscluster import ClusterAdminDBConnector
+
+
+class SchemaAdmin(ClusterAdminDBConnector):
+    AUTH_ROLE = "postgis-role"
+
+
+connector = SchemaAdmin()
+```
+
+`AUTH_ROLE`'s policy must allow `read` on `secret/data/<KV_PATH>`. The credential is static and unscoped, so grant that to as few roles as you can.
 
 ## License
 
