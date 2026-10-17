@@ -1,91 +1,278 @@
-# Test plan for src/pgiscluster/connector.py
+"""Tests for src/pgiscluster/connector.py"""
+
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import geopandas as gpd
+import pytest
+
+from pgiscluster import HostDBConnector
+from tests.conftest import (
+    FakeKube,
+    make_crd,
+    make_policy,
+    make_secret,
+    static_target,
+)
+
+LABEL = "app.kubernetes.io/name=postgis-cluster"
+
 
 # --- DBConnector._get_target ---
 
-# test_get_target_returns_host_and_port_on_happy_path
-#   given: mocked ApiextensionsV1Api returns the CiliumLocalRedirectPolicy CRD with
-#     one served version marked as storage
-#   and: mocked CustomObjectsApi.list_cluster_custom_object returns exactly one
-#     matching policy instance, shaped like apps/databases/postgis-localhost.yaml
-#   when: _get_target is called
-#   then: returns (ip, port) extracted from that instance's redirectFrontend.addressMatcher
 
-# test_get_target_raises_when_crd_has_no_served_version
-#   given: no version in the CRD's spec.versions is marked served
-#   when: _get_target is called
-#   then: raises RuntimeError naming the CRD and "no served version"
+def given_policies(kube: FakeKube, *policies: dict) -> None:
+    kube.extensions_api.list_custom_resource_definition.return_value = make_crd(
+        [("v2", True, True)]
+    )
+    kube.custom_objects_api.list_cluster_custom_object.return_value = {
+        "items": list(policies)
+    }
 
-# test_get_target_raises_when_no_storage_version_among_served
-#   given: served versions exist but none is marked storage
-#   when: _get_target is called
-#   then: raises RuntimeError naming the CRD and "no storage version"
 
-# test_get_target_raises_when_multiple_storage_versions
-#   given: more than one served version is marked storage
-#   when: _get_target is called
-#   then: raises RuntimeError naming the CRD and "multiple storage versions"
+def test_get_target_returns_host_and_port_on_happy_path(kube: FakeKube) -> None:
+    """given: the CiliumLocalRedirectPolicy CRD with one served storage version,
+    and exactly one matching policy instance
+    then: returns (ip, port) from that instance's redirectFrontend.addressMatcher"""
+    given_policies(kube, make_policy("169.254.0.5", 5432))
 
-# test_get_target_raises_when_zero_policies_match_label
-#   given: list_cluster_custom_object returns zero items for the
-#     app.kubernetes.io/name=postgis-cluster label
-#   when: _get_target is called
-#   then: raises RuntimeError naming the label and the count found (0)
+    connector = HostDBConnector()
 
-# test_get_target_raises_when_multiple_policies_match_label
-#   given: list_cluster_custom_object returns more than one item for that label
-#   when: _get_target is called
-#   then: raises RuntimeError naming the label and the count found (>1)
+    assert (connector.host, connector.port) == ("169.254.0.5", 5432)
+    kube.custom_objects_api.list_cluster_custom_object.assert_called_once_with(
+        group="cilium.io",
+        plural="ciliumlocalredirectpolicies",
+        version="v2",
+        label_selector=LABEL,
+    )
+
+
+def test_host_connector_uses_its_own_kubeconfig_client(kube: FakeKube) -> None:
+    """when: a HostDBConnector resolves its target and reads its Secret
+    then: both go through one ApiClient built from the kubeconfig, and the
+    process-wide default configuration is never touched"""
+    given_policies(kube, make_policy("169.254.0.5", 5432))
+    kube.core_api.read_namespaced_secret.return_value = make_secret("app", "pw")
+
+    HostDBConnector()._get_credentials()
+
+    kube.new_client_from_config.assert_called_once_with()
+    kube.load_kube_config.assert_not_called()
+
+
+def test_host_get_credentials_loads_kubeconfig_with_target_resolver(
+    kube: FakeKube,
+) -> None:
+    """given: a target_resolver, so the Cilium lookup never runs
+    when: _get_credentials is called
+    then: the kubeconfig is still loaded for the Secret read"""
+    kube.core_api.read_namespaced_secret.return_value = make_secret("app", "pw")
+
+    HostDBConnector(target_resolver=static_target)._get_credentials()
+
+    kube.new_client_from_config.assert_called_once_with()
+
+
+def test_get_target_raises_when_cilium_crd_missing(kube: FakeKube) -> None:
+    """given: no CiliumLocalRedirectPolicy CRD in the cluster
+    then: raises RuntimeError naming the CRD"""
+    crd_list = make_crd([("v2", True, True)])
+    crd_list.items = []
+    kube.extensions_api.list_custom_resource_definition.return_value = crd_list
+
+    with pytest.raises(RuntimeError, match="no CiliumLocalRedirectPolicy CRD"):
+        HostDBConnector()
+
+
+@pytest.mark.parametrize(
+    ("versions", "message"),
+    [
+        pytest.param([("v2", False, True)], "no served version", id="no-served"),
+        pytest.param(
+            [("v2", True, False), ("v2alpha1", True, False)],
+            "no storage version",
+            id="no-storage-among-served",
+        ),
+        pytest.param(
+            [("v2", True, True), ("v2alpha1", True, True)],
+            "multiple storage versions",
+            id="multiple-storage",
+        ),
+    ],
+)
+def test_get_target_raises_on_unusable_crd_versions(
+    kube: FakeKube, versions: list[tuple[str, bool, bool]], message: str
+) -> None:
+    """given: the CRD's versions have no served version, no storage version among
+    the served ones, or more than one storage version
+    then: raises RuntimeError naming the CRD and the problem"""
+    kube.extensions_api.list_custom_resource_definition.return_value = make_crd(
+        versions
+    )
+
+    with pytest.raises(
+        RuntimeError, match=f"CiliumLocalRedirectPolicy CRD has {message}"
+    ):
+        HostDBConnector()
+
+
+@pytest.mark.parametrize("count", [0, 2], ids=["zero", "multiple"])
+def test_get_target_raises_unless_exactly_one_policy_matches_label(
+    kube: FakeKube, count: int
+) -> None:
+    """given: zero or several policies match the postgis-cluster label
+    then: raises RuntimeError naming the label and the count found"""
+    given_policies(kube, *[make_policy("169.254.0.5", 5432)] * count)
+
+    with pytest.raises(RuntimeError, match=rf"{LABEL}, found {count}$"):
+        HostDBConnector()
+
+
+def test_get_target_raises_when_custom_object_response_is_not_a_dict(
+    kube: FakeKube,
+) -> None:
+    """given: list_cluster_custom_object returns something other than a dict
+    then: raises TypeError naming the type"""
+    given_policies(kube)
+    kube.custom_objects_api.list_cluster_custom_object.return_value = []
+
+    with pytest.raises(TypeError, match="got list"):
+        HostDBConnector()
+
 
 # --- HostDBConnector._get_credentials ---
 
-# test_get_credentials_returns_username_and_password_from_synced_secret
-#   given: mocked CoreV1Api.read_namespaced_secret("postgis-app-dynamic-credentials",
-#     "databases") returns a Secret with base64-encoded "username" and "password" data
-#   when: _get_credentials is called
-#   then: returns the decoded (username, password) tuple
 
-# test_get_credentials_fetches_fresh_each_call
-#   given: the mocked Secret read returns different values on two successive calls
-#     (simulating the secrets operator's credential rotation)
-#   when: _get_credentials is called twice
-#   then: read_namespaced_secret is called each time, not cached, and each call
-#     returns that call's current values
+def test_get_credentials_returns_username_and_password_from_synced_secret(
+    kube: FakeKube,
+) -> None:
+    """given: the dynamic-credentials Secret holds base64 username and password
+    then: returns the decoded (username, password) tuple"""
+    kube.core_api.read_namespaced_secret.return_value = make_secret("app", "pw")
 
-# test_get_credentials_raises_when_secret_missing_username_or_password
-#   given: the Secret's data is missing "username" or "password"
-#   when: _get_credentials is called
-#   then: raises RuntimeError naming the missing key
+    credentials = HostDBConnector(target_resolver=static_target)._get_credentials()
 
-# --- ClusterDBConnector._get_credentials ---
+    assert credentials == ("app", "pw")
+    kube.core_api.read_namespaced_secret.assert_called_once_with(
+        "postgis-app-dynamic-credentials", "databases"
+    )
 
-# test_get_credentials_returns_username_and_password_from_secrets_backend
-#   given: mocked hvac client read of "database/creds/postgis-app-role" returns
-#     data containing "username" and "password"
-#   when: _get_credentials is called
-#   then: returns that (username, password) tuple
 
-# test_get_credentials_fetches_fresh_each_call
-#   given: the mocked hvac read returns different lease credentials on two
-#     successive calls
-#   when: _get_credentials is called twice
-#   then: the secrets-backend read happens each time, not cached, and each call returns
-#     that call's current values
+def test_host_get_credentials_fetches_fresh_each_call(kube: FakeKube) -> None:
+    """given: the Secret changes between two reads, as when the operator rotates it
+    then: each call reads the Secret again and returns that read's values"""
+    kube.core_api.read_namespaced_secret.side_effect = [
+        make_secret("app-1", "pw-1"),
+        make_secret("app-2", "pw-2"),
+    ]
+    connector = HostDBConnector(target_resolver=static_target)
 
-# test_get_credentials_raises_when_backend_response_missing_credentials
-#   given: the hvac response data is missing "username" or "password"
-#   when: _get_credentials is called
-#   then: raises RuntimeError naming the missing key
+    assert connector._get_credentials() == ("app-1", "pw-1")
+    assert connector._get_credentials() == ("app-2", "pw-2")
+    assert kube.core_api.read_namespaced_secret.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("username", "password", "missing"),
+    [("app", None, "password"), (None, "pw", "username")],
+)
+def test_get_credentials_raises_when_secret_missing_username_or_password(
+    kube: FakeKube, username: str | None, password: str | None, missing: str
+) -> None:
+    """given: the Secret's data lacks username or password
+    then: raises RuntimeError naming the missing key"""
+    kube.core_api.read_namespaced_secret.return_value = make_secret(username, password)
+
+    with pytest.raises(RuntimeError, match=f"missing key\\(s\\): {missing}$"):
+        HostDBConnector(target_resolver=static_target)._get_credentials()
+
+
+def test_get_credentials_raises_when_secret_has_no_data(kube: FakeKube) -> None:
+    """given: the Secret has no data at all
+    then: raises RuntimeError naming the Secret"""
+    kube.core_api.read_namespaced_secret.return_value = make_secret(None, None)
+    kube.core_api.read_namespaced_secret.return_value.data = None
+
+    with pytest.raises(
+        RuntimeError, match="postgis-app-dynamic-credentials Secret has no data"
+    ):
+        HostDBConnector(target_resolver=static_target)._get_credentials()
+
 
 # --- DBConnector._create_engine ---
 
-# test_create_engine_do_connect_event_populates_cparams
-#   given: a DBConnector instance with known host/port and a fake _get_credentials
-#   when: the engine's "do_connect" event fires
-#   then: cparams["user"], ["password"], ["host"], ["port"], ["dbname"] match those sources
+
+def test_create_engine_do_connect_event_populates_cparams(kube: FakeKube) -> None:
+    """given: a connector with known host and port, and a Secret with credentials
+    when: the engine's do_connect event fires
+    then: user, password, host, port and dbname are filled in from those sources"""
+    kube.core_api.read_namespaced_secret.return_value = make_secret("app", "pw")
+    connector = HostDBConnector(database="gis", target_resolver=static_target)
+    cparams: dict = {}
+
+    connector.engine.dialect.dispatch.do_connect(
+        connector.engine.dialect, None, [], cparams
+    )
+
+    assert cparams == {
+        "user": "app",
+        "password": "pw",
+        "host": "db",
+        "port": 5432,
+        "dbname": "gis",
+    }
+
 
 # --- DBConnector.db_query ---
 
-# test_db_query_calls_read_postgis_with_given_args
-#   given: a DBConnector with a mocked engine
-#   when: db_query(query, geom_col) is called
-#   then: geopandas.read_postgis is called with that query, the engine, and that geom_col
+
+@pytest.fixture
+def read_postgis(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    fake = MagicMock(return_value=gpd.GeoDataFrame())
+    monkeypatch.setattr(gpd, "read_postgis", fake)
+    return fake
+
+
+def test_db_query_calls_read_postgis_with_given_args(
+    kube: FakeKube, read_postgis: MagicMock
+) -> None:
+    """when: db_query(query=..., geom_col=...) is called
+    then: read_postgis gets that query, the engine and that geom_col"""
+    connector = HostDBConnector(target_resolver=static_target)
+
+    result = connector.db_query(query="SELECT 1", geom_col="geom")
+
+    assert result is read_postgis.return_value
+    read_postgis.assert_called_once_with(
+        sql="SELECT 1", con=connector.engine, geom_col="geom"
+    )
+
+
+def test_db_query_reads_sql_from_query_file(
+    kube: FakeKube, read_postgis: MagicMock, tmp_path: Path
+) -> None:
+    """given: a .sql file
+    when: db_query(path, geom_col=...) is called
+    then: read_postgis gets the file's contents"""
+    query_file = tmp_path / "nearby.sql"
+    query_file.write_text("SELECT * FROM places")
+
+    HostDBConnector(target_resolver=static_target).db_query(query_file, geom_col="geom")
+
+    assert read_postgis.call_args.kwargs["sql"] == "SELECT * FROM places"
+
+
+@pytest.mark.parametrize(
+    "sources",
+    [{}, {"query_file": "nearby.sql", "query": "SELECT 1"}],
+    ids=["neither", "both"],
+)
+def test_db_query_raises_unless_exactly_one_source(
+    kube: FakeKube, sources: dict[str, str]
+) -> None:
+    """when: db_query is called with neither or both of query_file and query
+    then: raises ValueError"""
+    connector = HostDBConnector(target_resolver=static_target)
+
+    with pytest.raises(ValueError, match="exactly one of query_file or query"):
+        connector.db_query(**sources, geom_col="geom")
