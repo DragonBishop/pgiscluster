@@ -81,6 +81,7 @@ def static_target() -> tuple[str, int]:
 @dataclass
 class FakeKube:
     load_kube_config: MagicMock
+    new_client_from_config: MagicMock
     extensions_api: MagicMock
     custom_objects_api: MagicMock
     core_api: MagicMock
@@ -88,9 +89,11 @@ class FakeKube:
 
 @pytest.fixture
 def kube(monkeypatch: pytest.MonkeyPatch) -> FakeKube:
-    """Replaces the Kubernetes config loader and API classes with autospecced mocks."""
+    """Replaces the Kubernetes config loaders and API classes with autospecced mocks."""
     load_kube_config = MagicMock()
     monkeypatch.setattr(k8s.config, "load_kube_config", load_kube_config)
+    new_client_from_config = MagicMock()
+    monkeypatch.setattr(k8s.config, "new_client_from_config", new_client_from_config)
     apis = {}
     for name in ("ApiextensionsV1Api", "CustomObjectsApi", "CoreV1Api"):
         api_class = create_autospec(getattr(k8s.client, name))
@@ -98,6 +101,7 @@ def kube(monkeypatch: pytest.MonkeyPatch) -> FakeKube:
         apis[name] = api_class.return_value
     return FakeKube(
         load_kube_config=load_kube_config,
+        new_client_from_config=new_client_from_config,
         extensions_api=apis["ApiextensionsV1Api"],
         custom_objects_api=apis["CustomObjectsApi"],
         core_api=apis["CoreV1Api"],

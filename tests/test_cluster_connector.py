@@ -28,6 +28,7 @@ def test_cluster_get_target_returns_in_cluster_service(kube: FakeKube) -> None:
         5432,
     )
     kube.load_kube_config.assert_not_called()
+    kube.new_client_from_config.assert_not_called()
 
 
 # --- ClusterDBConnector._get_credentials ---
@@ -36,7 +37,8 @@ def test_cluster_get_target_returns_in_cluster_service(kube: FakeKube) -> None:
 def test_get_credentials_returns_username_and_password_from_secrets_backend(
     fake_vault: FakeVault, connector: ClusterDBConnector
 ) -> None:
-    """given: the backend's database/creds/postgis-app-role returns a username and password
+    """given: the backend's database/creds/postgis-app-role returns a username and
+    password
     then: returns that (username, password) tuple"""
     fake_vault.returns({"username": "v-etl-abc", "password": "pw"})
 

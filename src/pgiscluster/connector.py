@@ -1,7 +1,23 @@
+"""Connectors that resolve a PostGIS address and fresh credentials at runtime.
+
+Each connector answers two questions, where is the database and who logs in,
+through two methods its subclasses fill in:
+
+    _get_target         -> (host, port), resolved once at construction
+    _get_credentials    -> (username, password), fetched on every new connection
+
+                        _get_target                  _get_credentials
+    HostDBConnector     CiliumLocalRedirectPolicy    dynamic-credentials Secret
+    HostAdminDBConnector     (inherited)             superuser Secret
+    ClusterDBConnector  in-cluster Service           OpenBao database/creds
+    ClusterAdminDBConnector  (inherited)             OpenBao KV superuser entry
+"""
+
 import base64
 import os
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from functools import cached_property
 from pathlib import Path
 from typing import Any
 
@@ -11,71 +27,42 @@ import kubernetes as k8s
 import sqlalchemy as sql
 from sqlalchemy import event
 
+CREDENTIAL_KEYS = ("username", "password")
+
+
+def _first_env(*names: str) -> str | None:
+    """Returns the value of the first of the given environment variables that is set."""
+    return next((os.environ[name] for name in names if name in os.environ), None)
+
+
+def _username_password(data: Mapping[str, Any], source: str) -> tuple[Any, Any]:
+    """Returns data's username and password, raising if either is missing."""
+    missing_keys = [key for key in CREDENTIAL_KEYS if key not in data]
+    if missing_keys:
+        raise RuntimeError(f"{source} missing key(s): {', '.join(missing_keys)}")
+    return (data["username"], data["password"])
+
 
 class DBConnector(ABC):
-    """Assembles a PostgreSQL connection address, then queries the database"""
+    """Connects to a PostgreSQL database and queries it.
+
+    The engine's URL holds no address or login. Both are filled in each time
+    SQLAlchemy opens a new connection, so a rotated password reaches the next
+    connection without rebuilding the engine."""
 
     def __init__(
         self,
         database: str = "data_science",
         target_resolver: Callable[[], tuple[str, int]] | None = None,
     ) -> None:
-        self.drivername = "postgresql+psycopg"
         self.database = database
         self.host, self.port = (target_resolver or self._get_target)()
         self.engine = self._create_engine()
 
+    @abstractmethod
     def _get_target(self) -> tuple[str, int]:
-        """Returns the (host, port) to connect to, resolved live from the cluster's CiliumLocalRedirectPolicy."""
-        k8s.config.load_kube_config()
-        crd_list = k8s.client.ApiextensionsV1Api().list_custom_resource_definition()
-
-        local_policy = next(
-            crd
-            for crd in crd_list.items
-            if crd.spec.names.kind == "CiliumLocalRedirectPolicy"
-        )
-        group = local_policy.spec.group
-        plural = local_policy.spec.names.plural
-        served_versions = [
-            version for version in local_policy.spec.versions if version.served
-        ]
-        if not served_versions:
-            raise RuntimeError("CiliumLocalRedirectPolicy CRD has no served version")
-        storage_version_options = (
-            version for version in served_versions if version.storage
-        )
-        storage_version = next(storage_version_options, None)
-        if storage_version is None:
-            raise RuntimeError(
-                "CiliumLocalRedirectPolicy CRD has no storage version among its served versions"
-            )
-        if next(storage_version_options, None) is not None:
-            raise RuntimeError(
-                "CiliumLocalRedirectPolicy CRD has multiple storage versions"
-            )
-        raw_result = k8s.client.CustomObjectsApi().list_cluster_custom_object(
-            group=group,
-            plural=plural,
-            version=storage_version.name,
-            label_selector="app.kubernetes.io/name=postgis-cluster",
-        )
-        if not isinstance(raw_result, dict):
-            raise TypeError(
-                f"expected a dict from list_cluster_custom_object, got {type(raw_result).__name__}"
-            )
-        result: dict[str, Any] = raw_result
-        if len(result["items"]) != 1:
-            raise RuntimeError(
-                f"expected exactly one CiliumLocalRedirectPolicy matching label "
-                f"app.kubernetes.io/name=postgis-cluster, found {len(result['items'])}"
-            )
-        address_matcher = result["items"][0]["spec"]["redirectFrontend"][
-            "addressMatcher"
-        ]
-        host = address_matcher["ip"]
-        port = int(address_matcher["toPorts"][0]["port"])
-        return (host, port)
+        """Returns the (host, port) to connect to."""
+        raise NotImplementedError
 
     @abstractmethod
     def _get_credentials(self) -> tuple[str, str]:
@@ -83,18 +70,19 @@ class DBConnector(ABC):
         raise NotImplementedError
 
     def _create_engine(self) -> sql.Engine:
-        """Uses DBConnector attributes to return database address."""
-        engine = sql.create_engine(f"{self.drivername}://")
+        """Returns an engine that fills in the address and login per connection."""
+        engine = sql.create_engine("postgresql+psycopg://")
 
         @event.listens_for(engine, "do_connect")
-        def _inject_credentials(*args):
-            *_, cparams = args
+        def _inject_credentials(dialect, conn_rec, cargs, cparams) -> None:
             username, password = self._get_credentials()
-            cparams["user"] = username
-            cparams["password"] = password
-            cparams["host"] = self.host
-            cparams["port"] = self.port
-            cparams["dbname"] = self.database
+            cparams.update(
+                user=username,
+                password=password,
+                host=self.host,
+                port=self.port,
+                dbname=self.database,
+            )
 
         return engine
 
@@ -107,44 +95,91 @@ class DBConnector(ABC):
     ) -> gpd.GeoDataFrame:
         """Runs a SQL query against the PostGIS database, returning a GeoDataFrame.
 
-        Provide query_file (a path to a .sql file) or query (a literal SQL string).
+        Give exactly one of query_file (a path to a .sql file) or query (a
+        literal SQL string). geom_col names the one geometry column to decode.
         """
-        if query is None:
-            if query_file is None:
-                raise ValueError("either query_file or query must be given")
-            query = Path(query_file).read_text()
-        geodataframe = gpd.read_postgis(
-            sql=query,
-            con=self.engine,
-            # NOTE: GeoDataFrame can only analyze one geometry column at a time
-            geom_col=geom_col,
-        )
-        return geodataframe
+        if query is not None and query_file is None:
+            sql_text = query
+        elif query_file is not None and query is None:
+            sql_text = Path(query_file).read_text()
+        else:
+            raise ValueError("give exactly one of query_file or query")
+        return gpd.read_postgis(sql=sql_text, con=self.engine, geom_col=geom_col)
 
 
 class HostDBConnector(DBConnector):
-    """Connects to the database from outside the cluster, using
-    the operator-synced dynamic-credentials Secret."""
+    """Connects to the database from outside the cluster, through the current
+    kubeconfig context, using the operator-synced dynamic-credentials Secret."""
 
-    SECRET_NAME = "postgis-app-dynamic-credentials"
-    SECRET_NAMESPACE = "databases"
+    POLICY_KIND: str = "CiliumLocalRedirectPolicy"
+    POLICY_LABEL: str = "app.kubernetes.io/name=postgis-cluster"
+    SECRET_NAME: str = "postgis-app-dynamic-credentials"
+    SECRET_NAMESPACE: str = "databases"
+
+    @cached_property
+    def _api_client(self) -> k8s.client.ApiClient:
+        """Returns this connector's own client for the current kubeconfig context,
+        leaving the process-wide default configuration untouched."""
+        return k8s.config.new_client_from_config()
+
+    def _get_target(self) -> tuple[str, int]:
+        """Returns the (host, port) from the cluster's CiliumLocalRedirectPolicy."""
+        group, plural, version = self._policy_resource()
+        raw_result = k8s.client.CustomObjectsApi(
+            self._api_client
+        ).list_cluster_custom_object(
+            group=group,
+            plural=plural,
+            version=version,
+            label_selector=self.POLICY_LABEL,
+        )
+        if not isinstance(raw_result, dict):
+            raise TypeError(
+                "expected a dict from list_cluster_custom_object, "
+                f"got {type(raw_result).__name__}"
+            )
+        policies = raw_result["items"]
+        if len(policies) != 1:
+            raise RuntimeError(
+                f"expected exactly one {self.POLICY_KIND} matching label "
+                f"{self.POLICY_LABEL}, found {len(policies)}"
+            )
+        address_matcher = policies[0]["spec"]["redirectFrontend"]["addressMatcher"]
+        return (address_matcher["ip"], int(address_matcher["toPorts"][0]["port"]))
+
+    def _policy_resource(self) -> tuple[str, str, str]:
+        """Returns the policy CRD's (group, plural, storage version)."""
+        crd_list = k8s.client.ApiextensionsV1Api(
+            self._api_client
+        ).list_custom_resource_definition()
+        policy_crd = next(
+            (crd for crd in crd_list.items if crd.spec.names.kind == self.POLICY_KIND),
+            None,
+        )
+        if policy_crd is None:
+            raise RuntimeError(f"no {self.POLICY_KIND} CRD; is Cilium installed?")
+        served = [version for version in policy_crd.spec.versions if version.served]
+        if not served:
+            raise RuntimeError(f"{self.POLICY_KIND} CRD has no served version")
+        storage = [version for version in served if version.storage]
+        if not storage:
+            raise RuntimeError(
+                f"{self.POLICY_KIND} CRD has no storage version among its "
+                "served versions"
+            )
+        if len(storage) > 1:
+            raise RuntimeError(f"{self.POLICY_KIND} CRD has multiple storage versions")
+        return (policy_crd.spec.group, policy_crd.spec.names.plural, storage[0].name)
 
     def _get_credentials(self) -> tuple[str, str]:
-        """Returns a fresh (username, password) pair decoded from the operator-synced Secret."""
-        secret = k8s.client.CoreV1Api().read_namespaced_secret(
+        """Returns a fresh (username, password) pair decoded from the Secret."""
+        secret = k8s.client.CoreV1Api(self._api_client).read_namespaced_secret(
             self.SECRET_NAME, self.SECRET_NAMESPACE
         )
         if secret.data is None:
             raise RuntimeError(f"{self.SECRET_NAME} Secret has no data")
-        missing_keys = [
-            key for key in ("username", "password") if key not in secret.data
-        ]
-        if missing_keys:
-            raise RuntimeError(
-                f"{self.SECRET_NAME} Secret missing key(s): {', '.join(missing_keys)}"
-            )
-        username = base64.b64decode(secret.data["username"]).decode()
-        password = base64.b64decode(secret.data["password"]).decode()
+        encoded = _username_password(secret.data, f"{self.SECRET_NAME} Secret")
+        username, password = (base64.b64decode(value).decode() for value in encoded)
         return (username, password)
 
 
@@ -157,12 +192,7 @@ class HostAdminDBConnector(HostDBConnector):
     same credential CloudNativePG itself uses for cluster bootstrap and
     reconciliation. Use deliberately, not as a default."""
 
-    SECRET_NAME = "postgis-app-credentials"
-
-
-def _first_env(*names: str) -> str | None:
-    """Returns the value of the first of the given environment variables that is set."""
-    return next((os.environ[name] for name in names if name in os.environ), None)
+    SECRET_NAME: str = "postgis-app-credentials"
 
 
 class ClusterDBConnector(DBConnector):
@@ -185,18 +215,15 @@ class ClusterDBConnector(DBConnector):
         """Returns the in-cluster read-write Service address."""
         return (self.HOST, self.PORT)
 
-    def _vault_client(self) -> hvac.Client:
-        """Returns a client for the server named by BAO_ADDR or VAULT_ADDR."""
-        url = _first_env("BAO_ADDR", "VAULT_ADDR")
-        if url is None:
-            raise RuntimeError(
-                "set BAO_ADDR or VAULT_ADDR to the secrets backend's address"
-            )
-        ca_cert = _first_env("BAO_CACERT", "VAULT_CACERT")
-        return hvac.Client(url=url, verify=ca_cert or True)
-
     def _get_credentials(self) -> tuple[str, str]:
-        """Returns a fresh (username, password) pair generated by the secrets backend."""
+        """Returns a fresh (username, password) pair from the secrets backend."""
+        data = self._read_credentials(self._logged_in_client())
+        if not isinstance(data, dict):
+            raise TypeError(f"expected a data mapping from {self._credentials_path()}")
+        return _username_password(data, f"{self._credentials_path()} response")
+
+    def _logged_in_client(self) -> hvac.Client:
+        """Returns a client logged in to the backend as AUTH_ROLE."""
         if self.AUTH_ROLE is None:
             raise RuntimeError(
                 "set AUTH_ROLE to the Kubernetes auth role this pod logs in as"
@@ -208,21 +235,18 @@ class ClusterDBConnector(DBConnector):
                 f"no service account token at {self.TOKEN_PATH}; "
                 "mount a projected token or set TOKEN_PATH"
             ) from error
-        client = self._vault_client()
-        client.auth.kubernetes.login(role=self.AUTH_ROLE, jwt=token)
-        data = self._read_credentials(client)
-        if not isinstance(data, dict):
-            raise TypeError(f"expected a data mapping from {self._credentials_path()}")
-        missing_keys = [key for key in ("username", "password") if key not in data]
-        if missing_keys:
+        url = _first_env("BAO_ADDR", "VAULT_ADDR")
+        if url is None:
             raise RuntimeError(
-                f"{self._credentials_path()} response missing key(s): "
-                f"{', '.join(missing_keys)}"
+                "set BAO_ADDR or VAULT_ADDR to the secrets backend's address"
             )
-        return (data["username"], data["password"])
+        ca_cert = _first_env("BAO_CACERT", "VAULT_CACERT")
+        client = hvac.Client(url=url, verify=ca_cert or True)
+        client.auth.kubernetes.login(role=self.AUTH_ROLE, jwt=token)
+        return client
 
     def _credentials_path(self) -> str:
-        """Returns the backend path the credentials are read from, for error messages."""
+        """Returns the backend path the credentials come from, for error messages."""
         return f"database/creds/{self.DATABASE_ROLE}"
 
     def _read_credentials(self, client: hvac.Client) -> object:
@@ -246,7 +270,7 @@ class ClusterAdminDBConnector(ClusterDBConnector):
     KV_PATH: str = "postgis"
 
     def _credentials_path(self) -> str:
-        """Returns the KV entry the credentials are read from, for error messages."""
+        """Returns the KV entry the credentials come from, for error messages."""
         return f"{self.KV_MOUNT}/{self.KV_PATH}"
 
     def _read_credentials(self, client: hvac.Client) -> object:

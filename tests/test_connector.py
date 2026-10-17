@@ -39,13 +39,49 @@ def test_get_target_returns_host_and_port_on_happy_path(kube: FakeKube) -> None:
     connector = HostDBConnector()
 
     assert (connector.host, connector.port) == ("169.254.0.5", 5432)
-    kube.load_kube_config.assert_called_once_with()
     kube.custom_objects_api.list_cluster_custom_object.assert_called_once_with(
         group="cilium.io",
         plural="ciliumlocalredirectpolicies",
         version="v2",
         label_selector=LABEL,
     )
+
+
+def test_host_connector_uses_its_own_kubeconfig_client(kube: FakeKube) -> None:
+    """when: a HostDBConnector resolves its target and reads its Secret
+    then: both go through one ApiClient built from the kubeconfig, and the
+    process-wide default configuration is never touched"""
+    given_policies(kube, make_policy("169.254.0.5", 5432))
+    kube.core_api.read_namespaced_secret.return_value = make_secret("app", "pw")
+
+    HostDBConnector()._get_credentials()
+
+    kube.new_client_from_config.assert_called_once_with()
+    kube.load_kube_config.assert_not_called()
+
+
+def test_host_get_credentials_loads_kubeconfig_with_target_resolver(
+    kube: FakeKube,
+) -> None:
+    """given: a target_resolver, so the Cilium lookup never runs
+    when: _get_credentials is called
+    then: the kubeconfig is still loaded for the Secret read"""
+    kube.core_api.read_namespaced_secret.return_value = make_secret("app", "pw")
+
+    HostDBConnector(target_resolver=static_target)._get_credentials()
+
+    kube.new_client_from_config.assert_called_once_with()
+
+
+def test_get_target_raises_when_cilium_crd_missing(kube: FakeKube) -> None:
+    """given: no CiliumLocalRedirectPolicy CRD in the cluster
+    then: raises RuntimeError naming the CRD"""
+    crd_list = make_crd([("v2", True, True)])
+    crd_list.items = []
+    kube.extensions_api.list_custom_resource_definition.return_value = crd_list
+
+    with pytest.raises(RuntimeError, match="no CiliumLocalRedirectPolicy CRD"):
+        HostDBConnector()
 
 
 @pytest.mark.parametrize(
@@ -226,10 +262,17 @@ def test_db_query_reads_sql_from_query_file(
     assert read_postgis.call_args.kwargs["sql"] == "SELECT * FROM places"
 
 
-def test_db_query_raises_without_query_or_file(kube: FakeKube) -> None:
-    """when: db_query is called with neither query_file nor query
+@pytest.mark.parametrize(
+    "sources",
+    [{}, {"query_file": "nearby.sql", "query": "SELECT 1"}],
+    ids=["neither", "both"],
+)
+def test_db_query_raises_unless_exactly_one_source(
+    kube: FakeKube, sources: dict[str, str]
+) -> None:
+    """when: db_query is called with neither or both of query_file and query
     then: raises ValueError"""
     connector = HostDBConnector(target_resolver=static_target)
 
-    with pytest.raises(ValueError, match="either query_file or query"):
-        connector.db_query(geom_col="geom")
+    with pytest.raises(ValueError, match="exactly one of query_file or query"):
+        connector.db_query(**sources, geom_col="geom")
