@@ -2,7 +2,7 @@
 
 import pytest
 
-from pgiscluster import ClusterDBConnector
+from pgiscluster import ClusterAdminDBConnector, ClusterDBConnector
 from tests.conftest import FakeKube, FakeVault
 
 
@@ -189,3 +189,75 @@ def test_get_credentials_raises_when_token_file_missing(
 
     with pytest.raises(RuntimeError, match=str(fake_vault.token_path)):
         connector._get_credentials()
+
+
+# --- ClusterAdminDBConnector._get_credentials ---
+
+
+@pytest.fixture
+def admin_connector(fake_vault: FakeVault) -> ClusterAdminDBConnector:
+    """A ClusterAdminDBConnector with an auth role set and the fake projected token."""
+    connector = ClusterAdminDBConnector()
+    connector.AUTH_ROLE = "postgis-role"
+    connector.TOKEN_PATH = str(fake_vault.token_path)
+    return connector
+
+
+def test_admin_get_credentials_returns_superuser_from_kv(
+    fake_vault: FakeVault, admin_connector: ClusterAdminDBConnector
+) -> None:
+    """given: the KV v2 entry secret/postgis holds the superuser username and password
+    then: logs in as AUTH_ROLE, returns that pair, and generates no dynamic login"""
+    fake_vault.returns_kv({"username": "postgres", "password": "su-pw"})
+
+    assert admin_connector._get_credentials() == ("postgres", "su-pw")
+    fake_vault.client.auth.kubernetes.login.assert_called_once_with(
+        role="postgis-role", jwt="projected-jwt"
+    )
+    fake_vault.client.secrets.kv.v2.read_secret_version.assert_called_once_with(
+        path="postgis", mount_point="secret", raise_on_deleted_version=True
+    )
+    fake_vault.client.secrets.database.generate_credentials.assert_not_called()
+
+
+def test_admin_get_credentials_fetches_fresh_each_call(
+    fake_vault: FakeVault, admin_connector: ClusterAdminDBConnector
+) -> None:
+    """given: the KV entry changes between two reads, as when the password is rotated
+    then: each call reads the entry again and returns that read's values"""
+    fake_vault.returns_kv(
+        {"username": "postgres", "password": "su-1"},
+        {"username": "postgres", "password": "su-2"},
+    )
+
+    assert admin_connector._get_credentials() == ("postgres", "su-1")
+    assert admin_connector._get_credentials() == ("postgres", "su-2")
+
+
+def test_admin_get_credentials_raises_when_kv_entry_missing_credentials(
+    fake_vault: FakeVault, admin_connector: ClusterAdminDBConnector
+) -> None:
+    """given: the KV entry lacks a password
+    then: raises RuntimeError naming the entry and the missing key"""
+    fake_vault.returns_kv({"username": "postgres"})
+
+    with pytest.raises(
+        RuntimeError, match="secret/postgis response missing key\\(s\\): password$"
+    ):
+        admin_connector._get_credentials()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [{}, {"data": {}}, {"data": {"data": None}}],
+    ids=["no-data", "no-inner-data", "null-inner-data"],
+)
+def test_admin_get_credentials_raises_when_kv_response_has_no_data_dict(
+    fake_vault: FakeVault, admin_connector: ClusterAdminDBConnector, response: dict
+) -> None:
+    """given: the KV response has no data.data mapping
+    then: raises TypeError naming the entry"""
+    fake_vault.client.secrets.kv.v2.read_secret_version.return_value = response
+
+    with pytest.raises(TypeError, match="secret/postgis"):
+        admin_connector._get_credentials()

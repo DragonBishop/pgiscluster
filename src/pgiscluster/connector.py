@@ -210,14 +210,49 @@ class ClusterDBConnector(DBConnector):
             ) from error
         client = self._vault_client()
         client.auth.kubernetes.login(role=self.AUTH_ROLE, jwt=token)
-        creds_path = f"database/creds/{self.DATABASE_ROLE}"
-        response = client.secrets.database.generate_credentials(name=self.DATABASE_ROLE)
-        data = response.get("data") if isinstance(response, dict) else None
+        data = self._read_credentials(client)
         if not isinstance(data, dict):
-            raise TypeError(f"expected a data mapping from {creds_path}")
+            raise TypeError(f"expected a data mapping from {self._credentials_path()}")
         missing_keys = [key for key in ("username", "password") if key not in data]
         if missing_keys:
             raise RuntimeError(
-                f"{creds_path} response missing key(s): {', '.join(missing_keys)}"
+                f"{self._credentials_path()} response missing key(s): "
+                f"{', '.join(missing_keys)}"
             )
         return (data["username"], data["password"])
+
+    def _credentials_path(self) -> str:
+        """Returns the backend path the credentials are read from, for error messages."""
+        return f"database/creds/{self.DATABASE_ROLE}"
+
+    def _read_credentials(self, client: hvac.Client) -> object:
+        """Returns the data of a newly generated database login."""
+        response = client.secrets.database.generate_credentials(name=self.DATABASE_ROLE)
+        return response.get("data") if isinstance(response, dict) else None
+
+
+class ClusterAdminDBConnector(ClusterDBConnector):
+    """Connects to the database from inside a pod using the Postgres superuser
+    credential, for schema/DDL changes rather than routine queries.
+
+    Logs in to the secrets backend the same way as ClusterDBConnector, then
+    reads the static KV v2 entry KV_MOUNT/KV_PATH in place of a dynamic lease.
+    It's the entry External Secrets Operator syncs into the Secret
+    HostAdminDBConnector reads, so the same cautions apply: the credential
+    doesn't expire and isn't scoped to one database. AUTH_ROLE must have a
+    policy that can read it. Use deliberately, not as a default."""
+
+    KV_MOUNT: str = "secret"
+    KV_PATH: str = "postgis"
+
+    def _credentials_path(self) -> str:
+        """Returns the KV entry the credentials are read from, for error messages."""
+        return f"{self.KV_MOUNT}/{self.KV_PATH}"
+
+    def _read_credentials(self, client: hvac.Client) -> object:
+        """Returns the data of the latest version of the KV entry."""
+        response = client.secrets.kv.v2.read_secret_version(
+            path=self.KV_PATH, mount_point=self.KV_MOUNT, raise_on_deleted_version=True
+        )
+        data = response.get("data") if isinstance(response, dict) else None
+        return data.get("data") if isinstance(data, dict) else None

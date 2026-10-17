@@ -1,6 +1,7 @@
 """Module for pgiscluster."""
 
 from pgiscluster.connector import (
+    ClusterAdminDBConnector,
     ClusterDBConnector,
     HostAdminDBConnector,
     HostDBConnector,
@@ -8,4 +9,9 @@ from pgiscluster.connector import (
 
 __version__ = "0.2.0"
 
-__all__ = ["ClusterDBConnector", "HostAdminDBConnector", "HostDBConnector"]
+__all__ = [
+    "ClusterAdminDBConnector",
+    "ClusterDBConnector",
+    "HostAdminDBConnector",
+    "HostDBConnector",
+]

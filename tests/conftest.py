@@ -117,6 +117,13 @@ class FakeVault:
             for index, data in enumerate(credentials)
         ]
 
+    def returns_kv(self, *credentials: dict[str, str]) -> None:
+        """Queues one KV v2 read response per given data dict."""
+        self.client.secrets.kv.v2.read_secret_version.side_effect = [
+            {"data": {"data": data, "metadata": {"version": index + 1}}}
+            for index, data in enumerate(credentials)
+        ]
+
 
 @pytest.fixture
 def fake_vault(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> FakeVault:
