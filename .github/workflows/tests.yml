@@ -9,7 +9,25 @@ permissions:
   contents: read
 
 jobs:
+  release-only:
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      skip: ${{ steps.files.outputs.skip }}
+    steps:
+      - id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          RELEASE_FILES: '\.release-please-manifest\.json|CHANGELOG\.md|src/pgiscluster/__init__\.py'
+        run: |
+          other_files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename' | grep -v -x -E "$RELEASE_FILES" || true)
+          echo "skip=$([ -z "$other_files" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
   tests:
+    needs: release-only
+    if: ${{ !cancelled() && needs.release-only.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
