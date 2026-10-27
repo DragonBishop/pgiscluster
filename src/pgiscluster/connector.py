@@ -7,7 +7,7 @@ through two methods its subclasses fill in:
     _get_credentials    -> (username, password), fetched on every new connection
 
                         _get_target                  _get_credentials
-    HostDBConnector     CiliumLocalRedirectPolicy    dynamic-credentials Secret
+    HostDBConnector     CiliumLocalRedirectPolicy    OpenBao database/creds
     HostAdminDBConnector     (inherited)             superuser Secret
     ClusterDBConnector  in-cluster Service           OpenBao database/creds
     ClusterAdminDBConnector  (inherited)             OpenBao KV superuser entry
@@ -33,6 +33,33 @@ CREDENTIAL_KEYS = ("username", "password")
 def _first_env(*names: str) -> str | None:
     """Returns the value of the first of the given environment variables that is set."""
     return next((os.environ[name] for name in names if name in os.environ), None)
+
+
+def _logged_in_client(
+    auth_role: str, jwt: str, default_url: str | None = None
+) -> hvac.Client:
+    """Returns a client logged in to OpenBao or Vault with Kubernetes auth as auth_role.
+
+    The server address comes from BAO_ADDR, then VAULT_ADDR, then default_url,
+    and its CA file from BAO_CACERT, then VAULT_CACERT."""
+    url = _first_env("BAO_ADDR", "VAULT_ADDR") or default_url
+    if url is None:
+        raise RuntimeError(
+            "set BAO_ADDR or VAULT_ADDR to the secrets backend's address"
+        )
+    ca_cert = _first_env("BAO_CACERT", "VAULT_CACERT")
+    client = hvac.Client(url=url, verify=ca_cert or True)
+    client.auth.kubernetes.login(role=auth_role, jwt=jwt)
+    return client
+
+
+def _generated_credentials(client: hvac.Client, database_role: str) -> tuple[str, str]:
+    """Returns a newly generated (username, password) for database_role."""
+    response = client.secrets.database.generate_credentials(name=database_role)
+    data = response.get("data") if isinstance(response, dict) else None
+    if not isinstance(data, dict):
+        raise TypeError(f"expected a data mapping from database/creds/{database_role}")
+    return _username_password(data, f"database/creds/{database_role} response")
 
 
 def _username_password(data: Mapping[str, Any], source: str) -> tuple[Any, Any]:
@@ -109,12 +136,22 @@ class DBConnector(ABC):
 
 class HostDBConnector(DBConnector):
     """Connects to the database from outside the cluster, through the current
-    kubeconfig context, using the operator-synced dynamic-credentials Secret."""
+    kubeconfig context, using short-lived credentials from OpenBao.
+
+    Requests a token for SERVICE_ACCOUNT through the kubeconfig, logs in to
+    OpenBao with Kubernetes auth as AUTH_ROLE through its local redirect at
+    BAO_URL, then reads database/creds/DATABASE_ROLE. BAO_ADDR or VAULT_ADDR
+    overrides BAO_URL, and BAO_CACERT or VAULT_CACERT names OpenBao's CA file."""
 
     POLICY_KIND: str = "CiliumLocalRedirectPolicy"
-    POLICY_LABEL: str = "app.kubernetes.io/name=postgis-cluster"
-    SECRET_NAME: str = "postgis-app-dynamic-credentials"
-    SECRET_NAMESPACE: str = "databases"
+    POLICY_LABEL: str = "app.kubernetes.io/name=postgres-cluster"
+    BAO_URL: str = "https://127.0.0.1:8210"
+    AUTH_ROLE: str = "databases-role"
+    SERVICE_ACCOUNT: str = "databases-openbao-auth"
+    SERVICE_ACCOUNT_NAMESPACE: str = "databases"
+    TOKEN_AUDIENCE: str = "openbao"
+    TOKEN_SECONDS: int = 600
+    DATABASE_ROLE: str = "postgres-app-role"
 
     @cached_property
     def _api_client(self) -> k8s.client.ApiClient:
@@ -172,15 +209,25 @@ class HostDBConnector(DBConnector):
         return (policy_crd.spec.group, policy_crd.spec.names.plural, storage[0].name)
 
     def _get_credentials(self) -> tuple[str, str]:
-        """Returns a fresh (username, password) pair decoded from the Secret."""
-        secret = k8s.client.CoreV1Api(self._api_client).read_namespaced_secret(
-            self.SECRET_NAME, self.SECRET_NAMESPACE
+        """Returns a fresh (username, password) pair from OpenBao."""
+        client = _logged_in_client(
+            self.AUTH_ROLE, self._service_account_token(), self.BAO_URL
         )
-        if secret.data is None:
-            raise RuntimeError(f"{self.SECRET_NAME} Secret has no data")
-        encoded = _username_password(secret.data, f"{self.SECRET_NAME} Secret")
-        username, password = (base64.b64decode(value).decode() for value in encoded)
-        return (username, password)
+        return _generated_credentials(client, self.DATABASE_ROLE)
+
+    def _service_account_token(self) -> str:
+        """Returns a short-lived token for SERVICE_ACCOUNT, requested through the kubeconfig."""
+        request = k8s.client.AuthenticationV1TokenRequest(
+            spec=k8s.client.V1TokenRequestSpec(
+                audiences=[self.TOKEN_AUDIENCE], expiration_seconds=self.TOKEN_SECONDS
+            )
+        )
+        response = k8s.client.CoreV1Api(
+            self._api_client
+        ).create_namespaced_service_account_token(
+            self.SERVICE_ACCOUNT, self.SERVICE_ACCOUNT_NAMESPACE, request
+        )
+        return response.status.token
 
 
 class HostAdminDBConnector(HostDBConnector):
@@ -192,7 +239,19 @@ class HostAdminDBConnector(HostDBConnector):
     same credential CloudNativePG itself uses for cluster bootstrap and
     reconciliation. Use deliberately, not as a default."""
 
-    SECRET_NAME: str = "postgis-app-credentials"
+    SECRET_NAME: str = "postgres-superuser-credentials"
+    SECRET_NAMESPACE: str = "databases"
+
+    def _get_credentials(self) -> tuple[str, str]:
+        """Returns the (username, password) pair decoded from the superuser Secret."""
+        secret = k8s.client.CoreV1Api(self._api_client).read_namespaced_secret(
+            self.SECRET_NAME, self.SECRET_NAMESPACE
+        )
+        if secret.data is None:
+            raise RuntimeError(f"{self.SECRET_NAME} Secret has no data")
+        encoded = _username_password(secret.data, f"{self.SECRET_NAME} Secret")
+        username, password = (base64.b64decode(value).decode() for value in encoded)
+        return (username, password)
 
 
 class ClusterDBConnector(DBConnector):
@@ -205,9 +264,9 @@ class ClusterDBConnector(DBConnector):
     from BAO_CACERT, then VAULT_CACERT. Leases are not revoked; each ends at
     its TTL."""
 
-    HOST: str = "postgis-cluster-rw.databases.svc.cluster.local"
+    HOST: str = "postgres-cluster-rw.databases.svc.cluster.local"
     PORT: int = 5432
-    DATABASE_ROLE: str = "postgis-app-role"
+    DATABASE_ROLE: str = "postgres-app-role"
     AUTH_ROLE: str | None = None
     TOKEN_PATH: str = "/var/run/secrets/openbao/token"
 
@@ -235,15 +294,7 @@ class ClusterDBConnector(DBConnector):
                 f"no service account token at {self.TOKEN_PATH}; "
                 "mount a projected token or set TOKEN_PATH"
             ) from error
-        url = _first_env("BAO_ADDR", "VAULT_ADDR")
-        if url is None:
-            raise RuntimeError(
-                "set BAO_ADDR or VAULT_ADDR to the secrets backend's address"
-            )
-        ca_cert = _first_env("BAO_CACERT", "VAULT_CACERT")
-        client = hvac.Client(url=url, verify=ca_cert or True)
-        client.auth.kubernetes.login(role=self.AUTH_ROLE, jwt=token)
-        return client
+        return _logged_in_client(self.AUTH_ROLE, token)
 
     def _credentials_path(self) -> str:
         """Returns the backend path the credentials come from, for error messages."""
@@ -267,7 +318,7 @@ class ClusterAdminDBConnector(ClusterDBConnector):
     policy that can read it. Use deliberately, not as a default."""
 
     KV_MOUNT: str = "secret"
-    KV_PATH: str = "postgis"
+    KV_PATH: str = "postgres"
 
     def _credentials_path(self) -> str:
         """Returns the KV entry the credentials come from, for error messages."""

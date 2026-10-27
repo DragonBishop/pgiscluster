@@ -24,7 +24,7 @@ def test_cluster_get_target_returns_in_cluster_service(kube: FakeKube) -> None:
     connector = ClusterDBConnector()
 
     assert (connector.host, connector.port) == (
-        "postgis-cluster-rw.databases.svc.cluster.local",
+        "postgres-cluster-rw.databases.svc.cluster.local",
         5432,
     )
     kube.load_kube_config.assert_not_called()
@@ -37,14 +37,14 @@ def test_cluster_get_target_returns_in_cluster_service(kube: FakeKube) -> None:
 def test_get_credentials_returns_username_and_password_from_secrets_backend(
     fake_vault: FakeVault, connector: ClusterDBConnector
 ) -> None:
-    """given: the backend's database/creds/postgis-app-role returns a username and
+    """given: the backend's database/creds/postgres-app-role returns a username and
     password
     then: returns that (username, password) tuple"""
     fake_vault.returns({"username": "v-etl-abc", "password": "pw"})
 
     assert connector._get_credentials() == ("v-etl-abc", "pw")
     fake_vault.client.secrets.database.generate_credentials.assert_called_once_with(
-        name="postgis-app-role"
+        name="postgres-app-role"
     )
 
 
@@ -92,7 +92,7 @@ def test_get_credentials_raises_when_backend_response_has_no_data_dict(
     then: raises TypeError"""
     fake_vault.client.secrets.database.generate_credentials.return_value = {}
 
-    with pytest.raises(TypeError, match="database/creds/postgis-app-role"):
+    with pytest.raises(TypeError, match="database/creds/postgres-app-role"):
         connector._get_credentials()
 
 
@@ -200,7 +200,7 @@ def test_get_credentials_raises_when_token_file_missing(
 def admin_connector(fake_vault: FakeVault) -> ClusterAdminDBConnector:
     """A ClusterAdminDBConnector with an auth role set and the fake projected token."""
     connector = ClusterAdminDBConnector()
-    connector.AUTH_ROLE = "postgis-role"
+    connector.AUTH_ROLE = "databases-role"
     connector.TOKEN_PATH = str(fake_vault.token_path)
     return connector
 
@@ -208,16 +208,16 @@ def admin_connector(fake_vault: FakeVault) -> ClusterAdminDBConnector:
 def test_admin_get_credentials_returns_superuser_from_kv(
     fake_vault: FakeVault, admin_connector: ClusterAdminDBConnector
 ) -> None:
-    """given: the KV v2 entry secret/postgis holds the superuser username and password
+    """given: the KV v2 entry secret/postgres holds the superuser username and password
     then: logs in as AUTH_ROLE, returns that pair, and generates no dynamic login"""
     fake_vault.returns_kv({"username": "postgres", "password": "su-pw"})
 
     assert admin_connector._get_credentials() == ("postgres", "su-pw")
     fake_vault.client.auth.kubernetes.login.assert_called_once_with(
-        role="postgis-role", jwt="projected-jwt"
+        role="databases-role", jwt="projected-jwt"
     )
     fake_vault.client.secrets.kv.v2.read_secret_version.assert_called_once_with(
-        path="postgis", mount_point="secret", raise_on_deleted_version=True
+        path="postgres", mount_point="secret", raise_on_deleted_version=True
     )
     fake_vault.client.secrets.database.generate_credentials.assert_not_called()
 
@@ -244,7 +244,7 @@ def test_admin_get_credentials_raises_when_kv_entry_missing_credentials(
     fake_vault.returns_kv({"username": "postgres"})
 
     with pytest.raises(
-        RuntimeError, match="secret/postgis response missing key\\(s\\): password$"
+        RuntimeError, match="secret/postgres response missing key\\(s\\): password$"
     ):
         admin_connector._get_credentials()
 
@@ -261,5 +261,5 @@ def test_admin_get_credentials_raises_when_kv_response_has_no_data_dict(
     then: raises TypeError naming the entry"""
     fake_vault.client.secrets.kv.v2.read_secret_version.return_value = response
 
-    with pytest.raises(TypeError, match="secret/postgis"):
+    with pytest.raises(TypeError, match="secret/postgres"):
         admin_connector._get_credentials()
