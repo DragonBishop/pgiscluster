@@ -1,3 +1,14 @@
+## [0.4.0] - 2026-10-27
+
+### 🚀 Features
+
+- Update database credentials handling and OpenBao integration in connectors
+
+### ⚙️ Miscellaneous Tasks
+
+- Update copier template to v2.0.0
+- *(renovate)* Record the copier template's full git URL
+- Update copier template to v2.1.0
 ## [0.3.1] - 2026-10-17
 
 ### 🐛 Bug Fixes
