@@ -2,6 +2,7 @@
 
 import base64
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, create_autospec
@@ -10,6 +11,7 @@ import hvac
 import kubernetes as k8s
 import pytest
 from kubernetes.client import (
+    AuthenticationV1TokenRequest,
     V1CustomResourceDefinition,
     V1CustomResourceDefinitionList,
     V1CustomResourceDefinitionNames,
@@ -17,6 +19,8 @@ from kubernetes.client import (
     V1CustomResourceDefinitionVersion,
     V1ObjectMeta,
     V1Secret,
+    V1TokenRequestSpec,
+    V1TokenRequestStatus,
 )
 
 
@@ -50,9 +54,9 @@ def make_crd(
 
 
 def make_policy(ip: str, port: int) -> dict[str, Any]:
-    """Builds a policy instance shaped like apps/databases/postgis-localhost.yaml."""
+    """Builds a policy instance shaped like apps/databases/databases-localhost.yaml."""
     return {
-        "metadata": {"name": "postgis-localhost", "namespace": "databases"},
+        "metadata": {"name": "postgres-localhost", "namespace": "databases"},
         "spec": {
             "redirectFrontend": {
                 "addressMatcher": {
@@ -72,6 +76,16 @@ def make_secret(username: str | None, password: str | None) -> V1Secret:
         if value is not None
     }
     return V1Secret(data=data)
+
+
+def make_token_request(token: str) -> AuthenticationV1TokenRequest:
+    """Builds the TokenRequest the API server returns for a ServiceAccount token."""
+    return AuthenticationV1TokenRequest(
+        spec=V1TokenRequestSpec(audiences=["openbao"]),
+        status=V1TokenRequestStatus(
+            token=token, expiration_timestamp=datetime(2026, 1, 1, tzinfo=UTC)
+        ),
+    )
 
 
 def static_target() -> tuple[str, int]:

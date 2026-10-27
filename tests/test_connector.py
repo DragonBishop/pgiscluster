@@ -6,16 +6,18 @@ from unittest.mock import MagicMock
 import geopandas as gpd
 import pytest
 
-from pgiscluster import HostDBConnector
+from pgiscluster import HostAdminDBConnector, HostDBConnector
 from tests.conftest import (
     FakeKube,
+    FakeVault,
     make_crd,
     make_policy,
     make_secret,
+    make_token_request,
     static_target,
 )
 
-LABEL = "app.kubernetes.io/name=postgis-cluster"
+LABEL = "app.kubernetes.io/name=postgres-cluster"
 
 
 # --- DBConnector._get_target ---
@@ -47,12 +49,21 @@ def test_get_target_returns_host_and_port_on_happy_path(kube: FakeKube) -> None:
     )
 
 
-def test_host_connector_uses_its_own_kubeconfig_client(kube: FakeKube) -> None:
-    """when: a HostDBConnector resolves its target and reads its Secret
+def given_openbao_login(kube: FakeKube, fake_vault: FakeVault) -> None:
+    kube.core_api.create_namespaced_service_account_token.return_value = (
+        make_token_request("kube-jwt")
+    )
+    fake_vault.returns({"username": "v-app", "password": "pw"})
+
+
+def test_host_connector_uses_its_own_kubeconfig_client(
+    kube: FakeKube, fake_vault: FakeVault
+) -> None:
+    """when: a HostDBConnector resolves its target and requests its token
     then: both go through one ApiClient built from the kubeconfig, and the
     process-wide default configuration is never touched"""
     given_policies(kube, make_policy("169.254.0.5", 5432))
-    kube.core_api.read_namespaced_secret.return_value = make_secret("app", "pw")
+    given_openbao_login(kube, fake_vault)
 
     HostDBConnector()._get_credentials()
 
@@ -61,27 +72,16 @@ def test_host_connector_uses_its_own_kubeconfig_client(kube: FakeKube) -> None:
 
 
 def test_host_get_credentials_loads_kubeconfig_with_target_resolver(
-    kube: FakeKube,
+    kube: FakeKube, fake_vault: FakeVault
 ) -> None:
     """given: a target_resolver, so the Cilium lookup never runs
     when: _get_credentials is called
-    then: the kubeconfig is still loaded for the Secret read"""
-    kube.core_api.read_namespaced_secret.return_value = make_secret("app", "pw")
+    then: the kubeconfig is still loaded for the token request"""
+    given_openbao_login(kube, fake_vault)
 
     HostDBConnector(target_resolver=static_target)._get_credentials()
 
     kube.new_client_from_config.assert_called_once_with()
-
-
-def test_get_target_raises_when_cilium_crd_missing(kube: FakeKube) -> None:
-    """given: no CiliumLocalRedirectPolicy CRD in the cluster
-    then: raises RuntimeError naming the CRD"""
-    crd_list = make_crd([("v2", True, True)])
-    crd_list.items = []
-    kube.extensions_api.list_custom_resource_definition.return_value = crd_list
-
-    with pytest.raises(RuntimeError, match="no CiliumLocalRedirectPolicy CRD"):
-        HostDBConnector()
 
 
 @pytest.mark.parametrize(
@@ -120,7 +120,7 @@ def test_get_target_raises_on_unusable_crd_versions(
 def test_get_target_raises_unless_exactly_one_policy_matches_label(
     kube: FakeKube, count: int
 ) -> None:
-    """given: zero or several policies match the postgis-cluster label
+    """given: zero or several policies match the postgres-cluster label
     then: raises RuntimeError naming the label and the count found"""
     given_policies(kube, *[make_policy("169.254.0.5", 5432)] * count)
 
@@ -143,40 +143,86 @@ def test_get_target_raises_when_custom_object_response_is_not_a_dict(
 # --- HostDBConnector._get_credentials ---
 
 
-def test_get_credentials_returns_username_and_password_from_synced_secret(
-    kube: FakeKube,
+def test_host_get_credentials_logs_in_to_openbao_with_a_service_account_token(
+    kube: FakeKube, fake_vault: FakeVault
 ) -> None:
-    """given: the dynamic-credentials Secret holds base64 username and password
-    then: returns the decoded (username, password) tuple"""
-    kube.core_api.read_namespaced_secret.return_value = make_secret("app", "pw")
+    """given: the API server issues a token for databases-openbao-auth, and OpenBao
+    returns a login for postgres-app-role
+    then: logs in as databases-role with that token and returns that login"""
+    given_openbao_login(kube, fake_vault)
 
     credentials = HostDBConnector(target_resolver=static_target)._get_credentials()
 
-    assert credentials == ("app", "pw")
-    kube.core_api.read_namespaced_secret.assert_called_once_with(
-        "postgis-app-dynamic-credentials", "databases"
+    assert credentials == ("v-app", "pw")
+    name, namespace, request = (
+        kube.core_api.create_namespaced_service_account_token.call_args.args
+    )
+    assert (name, namespace) == ("databases-openbao-auth", "databases")
+    assert request.spec.audiences == ["openbao"]
+    assert request.spec.expiration_seconds == 600
+    fake_vault.client.auth.kubernetes.login.assert_called_once_with(
+        role="databases-role", jwt="kube-jwt"
+    )
+    fake_vault.client.secrets.database.generate_credentials.assert_called_once_with(
+        name="postgres-app-role"
     )
 
 
-def test_host_get_credentials_fetches_fresh_each_call(kube: FakeKube) -> None:
-    """given: the Secret changes between two reads, as when the operator rotates it
-    then: each call reads the Secret again and returns that read's values"""
-    kube.core_api.read_namespaced_secret.side_effect = [
-        make_secret("app-1", "pw-1"),
-        make_secret("app-2", "pw-2"),
-    ]
+def test_host_get_credentials_fetches_fresh_each_call(
+    kube: FakeKube, fake_vault: FakeVault
+) -> None:
+    """given: OpenBao returns a different login on each read
+    then: each call requests a token, logs in and reads again"""
+    kube.core_api.create_namespaced_service_account_token.return_value = (
+        make_token_request("kube-jwt")
+    )
+    fake_vault.returns(
+        {"username": "v-1", "password": "pw-1"},
+        {"username": "v-2", "password": "pw-2"},
+    )
     connector = HostDBConnector(target_resolver=static_target)
 
-    assert connector._get_credentials() == ("app-1", "pw-1")
-    assert connector._get_credentials() == ("app-2", "pw-2")
-    assert kube.core_api.read_namespaced_secret.call_count == 2
+    assert connector._get_credentials() == ("v-1", "pw-1")
+    assert connector._get_credentials() == ("v-2", "pw-2")
+    assert kube.core_api.create_namespaced_service_account_token.call_count == 2
+
+
+def test_host_get_credentials_defaults_to_the_local_redirect(
+    kube: FakeKube, fake_vault: FakeVault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """given: neither BAO_ADDR nor VAULT_ADDR is set
+    then: the client connects to OpenBao's local redirect at 127.0.0.1:8210"""
+    monkeypatch.delenv("BAO_ADDR")
+    given_openbao_login(kube, fake_vault)
+
+    HostDBConnector(target_resolver=static_target)._get_credentials()
+
+    fake_vault.client_class.assert_called_once_with(
+        url="https://127.0.0.1:8210", verify=True
+    )
+
+
+# --- HostAdminDBConnector._get_credentials ---
+
+
+def test_admin_get_credentials_returns_the_superuser_secret(kube: FakeKube) -> None:
+    """given: the superuser Secret holds base64 username and password
+    then: returns the decoded (username, password) tuple"""
+    kube.core_api.read_namespaced_secret.return_value = make_secret("postgres", "pw")
+
+    credentials = HostAdminDBConnector(target_resolver=static_target)._get_credentials()
+
+    assert credentials == ("postgres", "pw")
+    kube.core_api.read_namespaced_secret.assert_called_once_with(
+        "postgres-superuser-credentials", "databases"
+    )
 
 
 @pytest.mark.parametrize(
     ("username", "password", "missing"),
-    [("app", None, "password"), (None, "pw", "username")],
+    [("postgres", None, "password"), (None, "pw", "username")],
 )
-def test_get_credentials_raises_when_secret_missing_username_or_password(
+def test_admin_get_credentials_raises_when_secret_missing_username_or_password(
     kube: FakeKube, username: str | None, password: str | None, missing: str
 ) -> None:
     """given: the Secret's data lacks username or password
@@ -184,29 +230,31 @@ def test_get_credentials_raises_when_secret_missing_username_or_password(
     kube.core_api.read_namespaced_secret.return_value = make_secret(username, password)
 
     with pytest.raises(RuntimeError, match=f"missing key\\(s\\): {missing}$"):
-        HostDBConnector(target_resolver=static_target)._get_credentials()
+        HostAdminDBConnector(target_resolver=static_target)._get_credentials()
 
 
-def test_get_credentials_raises_when_secret_has_no_data(kube: FakeKube) -> None:
+def test_admin_get_credentials_raises_when_secret_has_no_data(kube: FakeKube) -> None:
     """given: the Secret has no data at all
     then: raises RuntimeError naming the Secret"""
     kube.core_api.read_namespaced_secret.return_value = make_secret(None, None)
     kube.core_api.read_namespaced_secret.return_value.data = None
 
     with pytest.raises(
-        RuntimeError, match="postgis-app-dynamic-credentials Secret has no data"
+        RuntimeError, match="postgres-superuser-credentials Secret has no data"
     ):
-        HostDBConnector(target_resolver=static_target)._get_credentials()
+        HostAdminDBConnector(target_resolver=static_target)._get_credentials()
 
 
 # --- DBConnector._create_engine ---
 
 
-def test_create_engine_do_connect_event_populates_cparams(kube: FakeKube) -> None:
-    """given: a connector with known host and port, and a Secret with credentials
+def test_create_engine_do_connect_event_populates_cparams(
+    kube: FakeKube, fake_vault: FakeVault
+) -> None:
+    """given: a connector with known host and port, and an OpenBao login
     when: the engine's do_connect event fires
     then: user, password, host, port and dbname are filled in from those sources"""
-    kube.core_api.read_namespaced_secret.return_value = make_secret("app", "pw")
+    given_openbao_login(kube, fake_vault)
     connector = HostDBConnector(database="gis", target_resolver=static_target)
     cparams: dict = {}
 
@@ -215,7 +263,7 @@ def test_create_engine_do_connect_event_populates_cparams(kube: FakeKube) -> Non
     )
 
     assert cparams == {
-        "user": "app",
+        "user": "v-app",
         "password": "pw",
         "host": "db",
         "port": 5432,
